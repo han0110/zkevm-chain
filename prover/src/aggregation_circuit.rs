@@ -1,6 +1,6 @@
 use crate::ProverParams;
 use halo2_proofs::{
-    circuit::{Layouter, SimpleFloorPlanner, Value},
+    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
     plonk::{self, Circuit, ConstraintSystem},
     poly::commitment::ParamsProver,
@@ -30,7 +30,7 @@ use plonk_verifier::{
     Protocol,
 };
 use rand::Rng;
-use std::rc::Rc;
+use std::{iter, rc::Rc};
 
 const LIMBS: usize = 4;
 const BITS: usize = 68;
@@ -104,12 +104,16 @@ impl SnarkWitness {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn aggregate<'a>(
     svk: &Svk,
     loader: &Rc<Halo2Loader<'a>>,
     snarks: &[SnarkWitness],
     as_proof: Value<&'_ [u8]>,
-) -> KzgAccumulator<G1Affine, Rc<Halo2Loader<'a>>> {
+) -> (
+    Vec<Vec<Vec<AssignedCell<Fr, Fr>>>>,
+    KzgAccumulator<G1Affine, Rc<Halo2Loader<'a>>>,
+) {
     let assign_instances = |instances: &[Vec<Value<Fr>>]| {
         instances
             .iter()
@@ -122,17 +126,29 @@ pub fn aggregate<'a>(
             .collect_vec()
     };
 
-    let accumulators = snarks
+    let (assigned_instances, accumulators) = snarks
         .iter()
-        .flat_map(|snark| {
+        .map(|snark| {
             let protocol = snark.protocol.loaded(loader);
             let instances = assign_instances(&snark.instances);
             let mut transcript =
                 PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, snark.proof());
             let proof = Plonk::read_proof(svk, &protocol, &instances, &mut transcript).unwrap();
-            Plonk::succinct_verify(svk, &protocol, &instances, &proof).unwrap()
+            let accumulators = Plonk::succinct_verify(svk, &protocol, &instances, &proof).unwrap();
+
+            let assigned_instances = instances
+                .iter()
+                .map(|instances| {
+                    instances
+                        .iter()
+                        .map(|instance| instance.assigned().to_owned())
+                        .collect_vec()
+                })
+                .collect_vec();
+            (assigned_instances, accumulators)
         })
-        .collect_vec();
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    let accumulators = accumulators.into_iter().flatten().collect_vec();
 
     let acccumulator = {
         let mut transcript = PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, as_proof);
@@ -140,7 +156,7 @@ pub fn aggregate<'a>(
         As::verify(&Default::default(), &accumulators, &proof).unwrap()
     };
 
-    acccumulator
+    (assigned_instances, acccumulator)
 }
 
 #[derive(Clone)]
@@ -222,9 +238,21 @@ impl AggregationCircuit {
         };
 
         let KzgAccumulator { lhs, rhs } = accumulator;
-        let instances = [lhs.x, lhs.y, rhs.x, rhs.y]
-            .map(fe_to_limbs::<_, _, LIMBS, BITS>)
-            .concat();
+        let instances = iter::empty()
+            // Output aggregated pairing input
+            .chain(
+                [lhs.x, lhs.y, rhs.x, rhs.y]
+                    .into_iter()
+                    .flat_map(fe_to_limbs::<_, _, LIMBS, BITS>),
+            )
+            // Also propagate aggregated snarks' instances
+            .chain(
+                snarks
+                    .iter()
+                    .flat_map(|snark| snark.instances.clone())
+                    .flatten(),
+            )
+            .collect_vec();
 
         Self {
             svk,
@@ -286,14 +314,15 @@ impl Circuit<Fr> for AggregationCircuit {
 
         range_chip.load_table(&mut layouter)?;
 
-        let accumulator_limbs = layouter.assign_region(
+        let (assigned_instances, accumulator_limbs) = layouter.assign_region(
             || "",
             |region| {
                 let ctx = RegionCtx::new(region, 0);
 
                 let ecc_chip = config.ecc_chip();
                 let loader = Halo2Loader::new(ecc_chip, ctx);
-                let accumulator = aggregate(&self.svk, &loader, &self.snarks, self.as_proof());
+                let (assigned_instances, accumulator) =
+                    aggregate(&self.svk, &loader, &self.snarks, self.as_proof());
 
                 let accumulator_limbs = [accumulator.lhs, accumulator.rhs]
                     .iter()
@@ -306,11 +335,15 @@ impl Circuit<Fr> for AggregationCircuit {
                     .into_iter()
                     .flatten();
 
-                Ok(accumulator_limbs)
+                Ok((assigned_instances, accumulator_limbs))
             },
         )?;
 
-        for (row, limb) in accumulator_limbs.enumerate() {
+        for (row, limb) in accumulator_limbs
+            .into_iter()
+            .chain(assigned_instances.into_iter().flatten().flatten())
+            .enumerate()
+        {
             main_gate.expose_public(layouter.namespace(|| ""), limb, row)?;
         }
 
